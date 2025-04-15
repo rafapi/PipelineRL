@@ -1,0 +1,138 @@
+# configs updated based on https://github.com/hkust-nlp/simpleRL-reason/blob/main/train/examples/script/train_ppo_qwen_base_math_lv35_1_node.sh
+# changed parameters marked below
+defaults:
+  - finetune: base 
+  - rewards: base
+  - _self_
+
+finetune:
+  use_flash_attention: true
+  attn_implementation: flash_attention_2
+  wandb_workspace_root: results
+  config_name: ${..model_path}
+  output_dir: ${..output_dir}/finetune
+  seq_length: 12000
+  seq_packing: true
+  rl:
+    # changed to compared to rl_eurus.yaml
+    algo: grpo
+    kl_coef: 0.01
+    reward_minus_kl_coef: 0.0
+    use_advantages: true
+    relu_log_p_weights: false
+    # changed from 10
+    clamp_log_ratio_ref_new_value: 5
+    temperature: ${...llm.parameters.temperature}
+    aggregate_loss: sum
+  # changed to 128
+  train_batch_size: 1
+  gradient_accumulation_passes: 130
+  gradient_checkpointing: true
+  # see https://medium.com/pytorch/how-activation-checkpointing-enables-scaling-up-training-deep-learning-models-7a93ae01ff2d
+  # for the motivation to this false by default
+  reentrant_checkpointing: false
+  # changed compared to rl_eurus.yaml
+  learning_rate: 5e-7
+  save_checkpoint_steps: 100
+  log_each_n_steps: 1
+  # async rl settings
+  input: training_data
+  send_weight_updates: true
+  queue_size: 20
+  max_lag: ${..max_lag}
+  weight_update_interval: 1
+  pop_old_data: ${..pop_old_data}
+actor:
+  sampling:
+    method: random
+  chunk_size: 8
+  threads_per_llm: 32
+  submit_delay: 0.3
+preprocess:
+  input: actor
+  output: training_data
+  threads_per_llm: 4
+  queue_size: 8
+  chunk_size: 16
+  submit_delay: 1.0
+  pop_old_data: ${..pop_old_data} 
+agent: 
+  max_prompt_length: 1024
+llm:
+  parameters:
+    # changed
+    max_tokens: 3000
+    # changed
+    temperature: 0.6
+test_llm:
+  parameters: 
+    max_tokens: ${...llm.parameters.max_tokens}
+    temperature: 0.
+    top_p: 1.0
+    top_k: 50
+
+vllm_config:
+  vllm_kwargs:
+    dtype: bfloat16
+    gpu-memory-utilization: 0.9
+    num-scheduler-steps: 1
+    disable-log-requests: ""
+    disable-frontend-multiprocessing: ""
+    max-num-seqs: 512
+    max-num-batched-tokens: 1024
+    enable-chunked-prefill: ""
+    return-tokens-as-token-ids: ""
+    tensor-parallel-size: 1
+    pipeline-parallel-size: 1
+
+world:
+  actors: 1
+  preprocessors: 1
+  
+  actor_fraction: 2
+  preprocessor_fraction: 1
+  finetune_fraction: 5
+
+  actor_group_port: 9000
+
+# changed
+system_prompt: Please reason step by step, and put your final answer within \boxed{}.
+task_template: |-
+  {task}
+
+eval_every_n_versions: 39000
+
+# changed
+model_path: Qwen/Qwen2.5-Math-7B
+
+# will use default based on the chosen backend
+accelerate_config: null
+use_deepspeed: true
+deepspeed_config: deepspeed_stage3_bf16
+use_fsdp: false
+fsdp:
+  param_dtype: fp32
+  reduce_dtype: fp32
+  buffer_dtype: fp32
+
+# control the lag
+pop_old_data: true
+max_lag: null
+
+force_restart: false
+# changed
+attempts: 8
+output_dir: ???
+discount_factor: 1
+debug:
+  mode: ""
+  streams_from: null
+  place_inference_workers: true
+
+train_dataset_names:
+  - math_simplerl_train
+train_subset: null
+
+test_dataset_names:
+  - aime_2024
+  - math_500

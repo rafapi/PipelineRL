@@ -1,0 +1,49 @@
+defaults:
+- base
+- override rewards: pure_success
+- _self_
+model_path: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+world:
+  actor_fraction: 4
+  preprocessor_fraction: 1
+  finetune_fraction: 3
+deepspeed_config: deepspeed_stage1_bf16
+vllm_config:
+  vllm_kwargs:
+    max-num-seq: 496
+    num-scheduler-steps: 1
+    max-num-batched-tokens: 4096
+    gpu-memory-utilization: 0.7
+actor:
+  chunk_size: 8
+  threads_per_llm: 16
+  submit_delay: 1.33
+preprocess:
+  queue_size: 8
+llm:
+  parameters:
+    max_tokens: 8096
+    temperature: 1.0
+finetune:
+  train_batch_size: 1
+  gradient_accumulation_passes: 144
+  weight_update_interval: 144
+  learning_rate: 5.0e-06
+  weight_decay: 0.01
+  rl:
+    kl_coef: 0.001
+    # for compatibility with the original DeepScaler setup
+    aggregate_loss: mean
+  # for compatibility with the original DeepScaler setup    
+  seq_packing: false
+  num_warmup_steps: 0
+  max_lag: null
+train_dataset_names: deepscaler_preview
+test_dataset_names:
+- math_500
+- aime_2024
+test_llm:
+  parameters:
+    temperature: 0.6
+    max_tokens: 16192
+eval_every_n_versions: 43200
