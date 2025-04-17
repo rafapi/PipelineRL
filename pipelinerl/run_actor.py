@@ -1,3 +1,4 @@
+import contextlib
 import copy
 import logging
 import math
@@ -6,11 +7,10 @@ import queue
 import random
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue
 from typing import List
-import multiprocessing as mp
 
 from pipelinerl.cot_math_agent import (
     CoTMathAgent,
@@ -26,7 +26,6 @@ from pydantic import BaseModel, Field
 from tapeagents.core import Tape, TrainingText
 from pipelinerl.finetune.logging_ import flatten_dict_config, init_wandb
 from tapeagents.llms import TrainableLLM
-from tqdm import tqdm
 
 import wandb
 from pipelinerl.load_datasets import load_datasets
@@ -34,7 +33,8 @@ from pipelinerl.state import TrainerState
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamSpec,
-    init_streams,
+    StreamWriter,
+    set_streams_backend,
     write_to_streams,
 )
 
@@ -282,7 +282,19 @@ class ActorLoop:
             can_submit_before_update = math.inf
 
         final_tape_queue = queue.Queue()
-        with ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor:
+        @contextlib.contextmanager
+        def maybe_write_stream(stream):
+            if stream:
+                with write_to_streams(stream, "a") as writer:
+                    yield writer
+            else:
+                yield None
+        with (
+            ThreadPoolExecutor(max_workers=self.thread_pool_size) as executor,
+            maybe_write_stream(self.data_stream) as data_stream_writer,
+            write_to_streams(self.tapes_stream, "a") as tapes_stream_writer,
+            write_to_streams(self.stats_stream, "a") as stats_writer,
+        ):
             logger.info(f"Using {executor} for parallel processing")
             # take sub samples of size cfg.actor.chunk_size // cfg.attempts
             while True:
@@ -346,48 +358,45 @@ class ActorLoop:
                 )
                 training_samples: List[TrainingText] = []
 
-                # do not shard tape channel cause why bother
-                with write_to_streams(self.tapes_stream, "a") as writer:
-                    max_model_version = -1
-                    for new_tape in final_tapes:
-                        tape_training_samples, tape_stats = (
-                            extract_tape_training_samples(
-                                new_tape, self.agent_replicas[0], self.cfg
-                            )
+                max_model_version = -1
+                for new_tape in final_tapes:
+                    tape_training_samples, tape_stats = (
+                        extract_tape_training_samples(
+                            new_tape, self.agent_replicas[0], self.cfg
                         )
+                    )
 
-                        max_model_version = max(
-                            max_model_version, new_tape.metadata.result["model_version"]
-                        )
-                        overflow = False
-                        for sample in tape_training_samples:
-                            sample.metadata["model_version"] = new_tape.metadata.result[
-                                "model_version"
-                            ]
-                            eos_token_id = self.agent_replicas[
-                                next_agent_replica
-                            ].llm.tokenizer.eos_token_id
-                            overflow = (
-                                False if sample.input_ids[-1] == eos_token_id else True
-                            ) or overflow
-                        
-                        tape_stats |= {"overflow": overflow}
-                        self.update_stats(new_tape, tape_stats)
+                    max_model_version = max(
+                        max_model_version, new_tape.metadata.result["model_version"]
+                    )
+                    overflow = False
+                    for sample in tape_training_samples:
+                        sample.metadata["model_version"] = new_tape.metadata.result[
+                            "model_version"
+                        ]
+                        eos_token_id = self.agent_replicas[
+                            next_agent_replica
+                        ].llm.tokenizer.eos_token_id
+                        overflow = (
+                            False if sample.input_ids[-1] == eos_token_id else True
+                        ) or overflow
+                    
+                    tape_stats |= {"overflow": overflow}
+                    self.update_stats(new_tape, tape_stats)
 
-                        if is_training:
-                            training_samples.extend(tape_training_samples)
+                    if is_training:
+                        training_samples.extend(tape_training_samples)
 
-                        # Important: write the tape after training samples are extracted,
-                        # because rewards are added at that time
-                        writer.write(new_tape)                            
+                    # Important: write the tape after training samples are extracted,
+                    # because rewards are added at that time
+                    tapes_stream_writer.write(new_tape)                            
 
 
                 published_samples += len(training_samples)
                 samples_in_queue = final_tape_queue.qsize() * self.cfg.actor.chunk_size                    
-                if self.data_stream and training_samples:
-                    with write_to_streams(self.data_stream, "a") as writer:
-                        for text in training_samples:
-                            writer.write(text)
+                if data_stream_writer and training_samples:
+                    for text in training_samples:
+                        data_stream_writer.write(text)
                     logger.info(
                         f"Published {len(training_samples)}{' ' + split_name if split_name else ''} samples/tapes"
                         f" to {self.data_stream} and {self.tapes_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the queue"
@@ -430,6 +439,7 @@ class ActorLoop:
                         loop_stats = {"published_model_version": max_model_version}
 
                     self.publish_stats(
+                        stats_writer=stats_writer,
                         loop_stats=loop_stats,
                         split_name=split_name,
                     )
@@ -437,7 +447,7 @@ class ActorLoop:
                 if finished_tapes == expected_number_of_tapes:
                     break
 
-    def publish_stats(self, loop_stats, split_name: str = ""):
+    def publish_stats(self, stats_writer: StreamWriter, loop_stats, split_name: str = ""):
         sliding_stats = self.stats_aggregator.get_stats()
         stats = (
             {
@@ -522,12 +532,13 @@ class ActorLoop:
         if "finished_chunks" in loop_stats and loop_stats["finished_chunks"] >= 2 * self.window_size:
             stats |= sliding_stats
         wandb.log({"actor/" + k: v for k, v in stats.items()})
-        with write_to_streams(self.stats_stream, "a") as writer:
-            writer.write(stats)
+        stats_writer.write(stats)
         self.init_stats()
 
 
 def run_actor_loop(cfg: DictConfig):
+    set_streams_backend(**cfg.streams)
+
     random.seed(42)
     exp_path = Path(cfg.output_dir)
     setup_logging(str(exp_path / "actor"))
@@ -541,8 +552,6 @@ def run_actor_loop(cfg: DictConfig):
     test_tape_stream = SingleStreamSpec(exp_path=exp_path, topic="test_tapes")
     stats_stream = SingleStreamSpec(exp_path=exp_path, topic="stats")
     data_stream = SingleStreamSpec(exp_path=exp_path, topic="actor")
-    for stream in [tape_stream, test_tape_stream, stats_stream, data_stream]:
-        init_streams(stream)
 
     train_dataset = load_datasets(cfg.train_dataset_names)
     test_dataset = load_datasets(cfg.test_dataset_names)

@@ -1,5 +1,5 @@
 import multiprocessing as mp
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 import logging
 import queue
 import time
@@ -31,8 +31,8 @@ from tapeagents.llms import TrainableLLM
 from pipelinerl.streams import (
     SingleStreamSpec,
     StreamRangeSpec,
-    init_streams,
     read_stream,
+    set_streams_backend,
     write_to_streams,
 )
 
@@ -49,6 +49,7 @@ def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
 
     for group_id, count in group_counts.items():
         if count != group_size:
+            logger.error(f"Group sizes are wrong: {group_counts}")
             return False
 
     return True
@@ -79,22 +80,20 @@ def batch_annotate_traces_with_ref_logprobs(
         ), f"{len(trace['ref_logprobs'])} != {len(trace['logprobs'])}"
 
 
-def replace_oov_tokens_with_the(data: list[dict], llm: TrainableLLM) -> list[dict]:
-    global TOKEN_IDS
-    
+def replace_oov_tokens_with_the(data: list[dict], tokenizer: transformers.PreTrainedTokenizerBase) -> list[dict]:
     patched_entries = 0
 
-    llm.load_tokenizer()
-    if TOKEN_IDS is None:
-        TOKEN_IDS = set(llm.tokenizer.get_vocab().values())
-    the_token_id = llm.tokenizer.get_vocab()["the"]
+    # TODO: yes this is slow. But should not be the bottleneck. We have to pickle the entire tokenizer
+    # every time we sent a task to the process pool anyway.
+    token_ids = set(tokenizer.get_vocab().values())
+    the_token_id = tokenizer.get_vocab()["the"]
 
     new_data = []
     for entry in data:
         new_input_ids = []
         invalid_token_ids = []
         for token_id in entry["input_ids"]:
-            if token_id not in TOKEN_IDS:
+            if token_id not in token_ids:
                 new_input_ids.append(the_token_id)
                 invalid_token_ids.append(token_id)
             else:
@@ -120,7 +119,7 @@ def replace_oov_tokens_with_the(data: list[dict], llm: TrainableLLM) -> list[dic
 
 
 def preprocess_dataset(
-    llm: TrainableLLM,
+    llm: TrainableLLM | None,
     data: list[dict],
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
@@ -132,16 +131,22 @@ def preprocess_dataset(
     columns = ["input_ids", "labels", "attention_mask"] + RL_DATA_COLUMNS
     logger.debug(f"Instantiated preprocess function hash {Hasher.hash(preprocess)}")
 
-    data = replace_oov_tokens_with_the(data, llm)
+    data = replace_oov_tokens_with_the(data, tokenizer)
     
     # inplace update of the traces with ref logprobs
-    batch_annotate_traces_with_ref_logprobs(llm, data)
+    if llm is not None:
+        batch_annotate_traces_with_ref_logprobs(llm, data)
+    else:
+        for entry in data:
+            entry["ref_logprobs"] = entry["logprobs"]
 
     dataset = Dataset.from_list(data)
     logger.debug(f"Raw data part size: {dataset.num_rows}")
     logger.debug(f"Raw data part fingerprint: {dataset._fingerprint}")
     dataset = dataset.map(preprocess, keep_in_memory=True, load_from_cache_file=False)
     dataset = dataset.with_format(columns=columns)
+    if not isinstance(tokenizer.eos_token_id, int):
+        raise ValueError(f"Tokenizer {tokenizer} does not have an eos_token_id")
     dataset = populate_rl_data(dataset=dataset, eos_token_id=tokenizer.eos_token_id, config=rl_config)
     dataset = dataset.add_column(
         "model_version", 
@@ -169,7 +174,7 @@ def run_dataset_loader(
                     if len(buffer) == chunk_size:
                         break
                 if not _check_group_sizes(buffer, check_group_size):
-                    raise ValueError(f"Invalid group sizes in data: {buffer}")
+                    raise ValueError(f"Invalid group sizes in data")
                 try:
                     raw_chunk_queue.put_nowait(buffer)
                 except queue.Full:
@@ -239,21 +244,21 @@ class SlidingWindowAggregator:
 
 
 def process_chunk(
-        llm: TrainableLLM,
-        chunk: list[dict],
-        tokenizer,
-        seq_length: int,
-        rl_config: RLConfig,
-        dataset_queue: queue.Queue,
+    llm: TrainableLLM,
+    chunk: list[dict],
+    tokenizer: transformers.PreTrainedTokenizerBase,
+    seq_length: int,
+    rl_config: RLConfig,
+    dataset_queue: queue.Queue,
 ):
-    preprocess_dataset_fn = partial(
-        preprocess_dataset,
-        tokenizer=tokenizer,
-        seq_length=seq_length,
-        rl_config=rl_config,
-    )
     try:
-        dataset = preprocess_dataset_fn(llm=llm, data=chunk)
+        dataset = preprocess_dataset(
+            llm=llm,
+            data=chunk,
+            tokenizer=tokenizer,
+            seq_length=seq_length,
+            rl_config=rl_config,
+        )
         try:
             dataset_queue.put_nowait(dataset)
         except queue.Full:
@@ -268,6 +273,8 @@ def process_chunk(
 def run_preprocessing_loop(
     cfg: DictConfig,
 ):
+    set_streams_backend(**cfg.streams)
+
     world_map = WorldMap(cfg)
     exp_root_dir = Path(cfg.output_dir)
 
@@ -276,8 +283,10 @@ def run_preprocessing_loop(
         raise ValueError("Failed to initialize wandb run")
 
     tokenizer = load_tokenizer(cfg.finetune.config_name)
-    llm_urls = str(cfg.me.llm_urls).split("+")
-    wait_for_inference_servers(llm_urls)
+
+    llm_urls = str(cfg.me.llm_urls).split("+") if cfg.me.llm_urls else []
+    if llm_urls:
+        wait_for_inference_servers(llm_urls)
 
     input_stream = SingleStreamSpec(exp_path=exp_root_dir, topic=cfg.preprocess.input)
     output_stream = StreamRangeSpec(
@@ -286,8 +295,6 @@ def run_preprocessing_loop(
         partition_range=(0, world_map.total_finetune_gpus),
     )
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
-    init_streams(output_stream)
-    init_streams(stats_streams)
     logger.info(f"Streams initialized")
 
     raw_chunk_queue = Queue(cfg.preprocess.queue_size)
@@ -317,7 +324,7 @@ def run_preprocessing_loop(
 
     submitted_chunks = 0
     processed_chunks = 0
-    worker_pool_size = cfg.preprocess.threads_per_llm * len(llms)   
+    worker_pool_size = cfg.preprocess.threads_per_llm * max(len(llms), 1)
     next_llm_index = 0
 
     stats_aggregator = SlidingWindowAggregator(window_size=500 // cfg.preprocess.chunk_size)
@@ -326,23 +333,22 @@ def run_preprocessing_loop(
     with write_to_streams(output_stream) as writer, write_to_streams(stats_streams) as stats_writer:
         with mp.Manager() as manager:
             dataset_queue = manager.Queue()
+            logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
                     try:
-                        llm = llms[next_llm_index]
+                        llm = llms[next_llm_index] if llms else None
 
                         now = time.time()
-                        if (
-                            submitted_chunks - processed_chunks < worker_pool_size 
-                            and now - last_submit > cfg.preprocess.submit_delay / len(llms)
-                        ):
+                        waited_enough = not llms or now - last_submit > cfg.preprocess.submit_delay / len(llms)
+                        if waited_enough and submitted_chunks - processed_chunks < worker_pool_size:
                             try:
                                 raw_chunk = raw_chunk_queue.get(timeout=0.01)
                                 if isinstance(raw_chunk, Exception):
                                     raise raw_chunk
                                 future = executor.submit(
                                     process_chunk, 
-                                    llm, raw_chunk, tokenizer, 
+                                    llm, raw_chunk, tokenizer,
                                     cfg.finetune.seq_length, rl_config, dataset_queue
                                 )
                                 future.add_done_callback(
@@ -355,7 +361,7 @@ def run_preprocessing_loop(
                                 )
                                 submitted_chunks += 1
                                 last_submit = now
-                                next_llm_index = (next_llm_index + 1) % len(llms)
+                                next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
                             except Empty:
                                 pass
 

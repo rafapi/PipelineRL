@@ -3,6 +3,7 @@
 defaults:
   - finetune: base 
   - rewards: base
+  - streams: files
   - _self_
 
 finetune:

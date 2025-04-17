@@ -12,7 +12,7 @@ import hydra
 from omegaconf import DictConfig, OmegaConf
 
 from pipelinerl.state import TrainerState
-from pipelinerl.streams import SingleStreamSpec, read_stream, write_to_streams
+from pipelinerl.streams import SingleStreamSpec, connect_to_redis, read_stream, set_streams_backend, write_to_streams
 from pipelinerl.utils import terminate_with_children
 from pipelinerl.world import WorldMap
 
@@ -27,11 +27,10 @@ os.environ["VLLM_LOGGING_LEVEL"] = "DEBUG"
 
 
 def _popen(
-    cmd: str,
+    cmd: list[str],
     env: dict | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
-    shell: bool = False,
 ) -> subprocess.Popen:
     """Wrapper around subprocess.Popen that allows for easier debugging."""
     if os.environ.get("DRY_RUN", "0") == "1":
@@ -41,7 +40,6 @@ def _popen(
         env=env,
         stdout=stdout,
         stderr=stderr,
-        shell=shell,
     )
 
 
@@ -50,6 +48,8 @@ def validate_config(cfg: DictConfig):
         raise ValueError("preprocess chunk_size must be a multiple of attempts")
     if cfg.actor.chunk_size % cfg.attempts != 0:
         raise ValueError("actor chunk_size must be a multiple of attempts")
+    if cfg.world.preprocessor_fraction == 0 and cfg.finetune.rl.kl_coef > 0.0:
+        raise ValueError("Preprocessor fraction must be > 0 if KL is used")
 
 
 def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
@@ -57,29 +57,33 @@ def run_ref_llm(cfg: DictConfig, preprocessor_llm_idx: int, local_idx: int, gpus
     if kwargs["num-scheduler-steps"] > 1:
         kwargs["num-scheduler-steps"] = 1
         logger.warning(f"Set num-scheduler-steps to 1 for reference vLLM")
-    kwargs_str = " ".join([f"--{k} {v}" for k, v in kwargs.items()])
     log_dir = exp_dir / f"ref_vllm_{preprocessor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
 
-    str_cmd = (
-        "python -m vllm.entrypoints.openai.api_server "
-        f"--model {cfg.model_path} "
-        f"--port {8180 + local_idx} "
-        "--host 0.0.0.0 "
-        f"--seed {preprocessor_llm_idx} "
-        f"{kwargs_str}"
-    )
+    cmd = [
+        "python", "-m", "vllm.entrypoints.openai.api_server",
+        "--model", str(cfg.model_path),
+        "--port", str(8180 + local_idx),
+        "--host", "0.0.0.0",
+        "--seed", str(preprocessor_llm_idx),
+    ]
+    
+    # Add vLLM kwargs as separate arguments
+    for k, v in kwargs.items():
+        cmd.append(f"--{k}")
+        if v not in [None, ""]:
+            cmd.append(str(v))
+    
     gpu_str = ",".join([str(gpu) for gpu in gpus])
-    logger.info(f"Running reference LLM with command: {str_cmd} with gpus: {gpu_str}")
+    logger.info(f"Running reference LLM with command: {' '.join(cmd)} with gpus: {gpu_str}")
     log_file_path = os.path.join(log_dir, f"stdout.log")
     err_file_path = os.path.join(log_dir, f"stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         yield _popen(
-            str_cmd,
+            cmd,
             env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
             stdout=log_file,
             stderr=err_file,
-            shell=True,
         )
 
 
@@ -90,40 +94,41 @@ def run_actor_llm(cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, loca
     else:
         actor_model_path = cfg.model_path
 
-    kwargs_str = (
-        " ".join([f"--{k} {v}" for k, v in cfg.vllm_config.vllm_kwargs.items()])
-        if cfg.vllm_config.vllm_kwargs
-        else ""
-    )
     # TODO: add support for tensor and process parallelism
     log_dir = exp_dir / f"actor_vllm_{actor_llm_idx}"
     os.makedirs(log_dir, exist_ok=True)
+    cmd = [
+        "python", "-m", "pipelinerl.entrypoints.llm",
+        "--model", str(actor_model_path),
+        "--host", "0.0.0.0",
+        "--port", str(8080 + local_idx),
+        "--seed", str(actor_llm_idx),
+        "--exp-root-dir", str(exp_dir),
+        "--actor-llm-idx", str(actor_llm_idx),
+        "--weight-update-group-init-method", f"tcp://{world_map.master_addr}:{cfg.world.actor_group_port}",
+        "--weight-update-group-world-size", str(world_map.weight_update_group_size),
+    ]
     
-    str_cmd = (
-        "python -m pipelinerl.entrypoints.llm "
-        f"--model {actor_model_path} "
-        "--host 0.0.0.0 "
-        f"--port {8080 + local_idx} "
-        f"--seed {actor_llm_idx} "
-        f"{kwargs_str} "
-        f"--exp-root-dir {exp_dir} "
-        f"--actor-llm-idx {actor_llm_idx} "
-        f"--weight-update-group-init-method tcp://{world_map.master_addr}:{cfg.world.actor_group_port} "
-        f"--weight-update-group-world-size {world_map.weight_update_group_size} "
-    )
+    # Add vLLM kwargs as separate arguments
+    if cfg.vllm_config.vllm_kwargs:
+        for k, v in cfg.vllm_config.vllm_kwargs.items():
+            cmd.append(f"--{k}")
+            if v not in [None, ""]:
+                cmd.append(str(v))
+            
     if cfg.debug.mode in ["actor", "open_loop"]:
-        str_cmd += " --disable-weight-updates"
+        cmd.append("--disable-weight-updates")
+        
     gpu_str = ",".join([str(gpu) for gpu in gpus])
-    logger.info(f"Running actor_llm with command: {str_cmd} on gpus: {gpu_str}")
+    logger.info(f"Running actor_llm with command: {' '.join(cmd)} on gpus: {gpu_str}")
     log_file_path = os.path.join(log_dir, f"stdout.log")
     err_file_path = os.path.join(log_dir, f"stderr.log")
     with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
         yield _popen(
-            str_cmd,
-            env={**os.environ, "CUDA_VISIBLE_DEVICES": str(gpu_str)},
+            cmd,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
             stdout=log_file,
             stderr=err_file,
-            shell=True,
         )
 
 
@@ -131,16 +136,19 @@ def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     if actor_idx != 0:
         raise NotImplementedError("Can only do 1 actor yet")
     llm_urls = "+".join(world_map.get_actor_urls())
-    str_cmd = (
-        "python -m pipelinerl.entrypoints.actor "
-        f"--config-dir {exp_dir}/conf "
-        f"--config-name exp_config "
-        f"output_dir={exp_dir} "
-        f"hydra.run.dir={exp_dir}/actor "
-        f"+me.llm_urls={llm_urls} "
+    cmd = [
+        "python", "-m", "pipelinerl.entrypoints.actor",
+        "--config-dir", f"{exp_dir}/conf",
+        "--config-name", "exp_config",
+        f"output_dir={exp_dir}",
+        f"hydra.run.dir={exp_dir}/actor",
+        f"+me.llm_urls={llm_urls}",
+    ]
+    logger.info(f"Running actor with command: {' '.join(cmd)}")
+    yield _popen(
+        cmd,
+        env=dict(os.environ),
     )
-    logger.info(f"Running actor with command: {str_cmd}")
-    yield _popen(str_cmd, env=dict(os.environ), shell=True)
 
 
 def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir: Path):
@@ -228,12 +236,12 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
     if cfg.debug.mode in ["finetune", "open_loop"]:
         cmd.append("finetune.send_weight_updates=False")
     
-    str_cmd = " ".join(cmd)
-    logger.info(f"Running finetune with command: {str_cmd}")
+    logger.info(f"Running finetune with command: {' '.join(cmd)}")
+    env = dict(os.environ)
+    env["DS_ENV_FILE"] = str(exp_dir/".deepspeed_env")
     yield _popen(
-        str_cmd, 
-        env=dict(os.environ) | {"DS_ENV_FILE": exp_dir/".deepspeed_env"},
-          shell=True
+        cmd,
+        env=env
     )
 
 
@@ -241,16 +249,32 @@ def run_preprocess(world_map: WorldMap, preprocessor_idx: int, exp_dir: Path):
     if preprocessor_idx != 0:
         raise NotImplementedError("Can only do 1 preprocessor yet")
     llm_urls = "+".join(world_map.get_preprocessor_urls())
-    str_cmd = (
-        "python -m pipelinerl.entrypoints.preprocess "
-        f"--config-dir {exp_dir}/conf "
-        f"--config-name exp_config "
-        f"output_dir={exp_dir} "
-        f"hydra.run.dir={exp_dir}/preprocess "
-        f"+me.llm_urls={llm_urls} "
+    cmd = [
+        "python", "-m", "pipelinerl.entrypoints.preprocess",
+        "--config-dir", f"{exp_dir}/conf",
+        "--config-name", "exp_config",
+        f"output_dir={exp_dir}",
+        f"hydra.run.dir={exp_dir}/preprocess",
+        f"+me.llm_urls={llm_urls}",
+    ]
+    logger.info(f"Running preprocess with command: {' '.join(cmd)}")
+    yield _popen(
+        cmd,
+        env=dict(os.environ),
     )
-    logger.info(f"Running preprocess with command: {str_cmd}")
-    yield _popen(str_cmd, env=dict(os.environ), shell=True)
+
+
+def run_redis(cfg: DictConfig):
+    # Launch redis-server
+    cmd = [
+        "redis-server",
+        "--bind", "0.0.0.0",
+        "--port", str(cfg.streams.port),
+        "--dir", str(cfg.output_dir),
+        "--protected-mode", "no"
+    ]
+    logger.info(f"Running redis with command: {' '.join(cmd)}")
+    yield _popen(cmd, env=dict(os.environ))
 
 
 def clean_up(exp_dir, force_restart):
@@ -260,6 +284,8 @@ def clean_up(exp_dir, force_restart):
             shutil.rmtree(f"{exp_dir}/streams")
         else:
             os.remove(f"{exp_dir}/streams")
+    if os.path.exists(f"{exp_dir}/dump.rdb"):
+        os.remove(f"{exp_dir}/dump.rdb")
 
     if force_restart:
         if os.path.exists(f"{exp_dir}/finetune"):
@@ -290,8 +316,8 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
             terminate_with_children(proc.pid)
     logger.info("I have launched everyone, waiting for them to finish...")
 
-    last_trainer_version = -1
-    last_time_new_version = time.time()
+    # last_trainer_version = -1
+    # last_time_new_version = time.time()
 
     try:
         # Wait for all processes to complete
@@ -303,14 +329,15 @@ def watch_processes_running(exp_path: Path, processes: List[subprocess.Popen], d
                     logger.error(f"Process {proc.args} terminated with code {proc.returncode}")
                     gently_stop_all_processes()
                     sys.exit(1)
-            if (trainer_state is not None
-                and (version := trainer_state.propagated_weight_version is not None) 
-                and version > last_trainer_version):
-                last_trainer_version = version
-                last_time_new_version = time.time()
-            if not debug_mode and time.time() - last_time_new_version > 1800:
-                logger.error("No new weight update in 30 minutes, exiting")
-                sys.exit(1) 
+            # TODO: make the watcdog code below more stable
+            # if (trainer_state is not None
+            #     and (version := trainer_state.propagated_weight_version is not None) 
+            #     and version > last_trainer_version):
+            #     last_trainer_version = version
+            #     last_time_new_version = time.time()
+            # if not debug_mode and time.time() - last_time_new_version > 1800:
+            #     logger.error("No new weight update in 30 minutes, exiting")
+            #     sys.exit(1) 
             time.sleep(1.0)
     except KeyboardInterrupt:
         gently_stop_all_processes()
@@ -363,9 +390,11 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
 )
 def main(cfg: DictConfig):    
     validate_config(cfg)
+
     world_map = WorldMap(cfg, verbose=True)
     exp_dir = Path(cfg.output_dir)    
     config_dir = exp_dir / "conf"
+
 
     group = str(exp_dir)
     root = cfg.finetune.wandb_workspace_root
@@ -383,15 +412,23 @@ def main(cfg: DictConfig):
                 f"to make it divisible by {n_gpus} processes"
             )
             cfg.finetune.gradient_accumulation_passes = new_accum_passes
+    if cfg.streams.backend == "redis":
+        cfg.streams.host = world_map.master_addr
+    set_streams_backend(**cfg.streams)
+
+    processes = []
 
     lead_launcher_stream = SingleStreamSpec(exp_path=exp_dir, topic="launcher_0")
     init_msg = {"exp_init": "true"}
-    
     if world_map.my_rank == 0:
         clean_up(exp_dir, cfg.force_restart)
         os.makedirs(config_dir, exist_ok=True)
         OmegaConf.save(cfg, config_dir / "exp_config.yaml")        
         logger.info(f"Orchestrator 0 created the exp folder")
+        if cfg.streams.backend == "redis":
+            processes.extend(run_redis(cfg))
+            redis = connect_to_redis(cfg.streams)
+            redis.flushall()
 
         if world_map.world_size > 1:
             assert world_map.master_addr.startswith("dns-") and world_map.master_addr.endswith("-0")
@@ -417,13 +454,13 @@ def main(cfg: DictConfig):
         logger.info(f"Orchestrator {world_map.my_rank} heard that the exp folder is ready.")
 
     if cfg.debug.mode == "finetune":
-        processes = launch_jobs(cfg, world_map, ["finetune"])
+        processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
     elif cfg.debug.mode == "actor":
-        processes = launch_jobs(cfg, world_map, ["actor", "actor_llm"])
+        processes.extend(launch_jobs(cfg, world_map, ["actor", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
-        processes = launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"])
+        processes.extend(launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"]))
     elif cfg.debug.mode in ["", "open_loop"]:
-        processes = launch_jobs(cfg, world_map)
+        processes.extend(launch_jobs(cfg, world_map))
     else:
         raise NotImplementedError(f"Unknown debug mode {cfg.debug.mode}")
         

@@ -1,11 +1,11 @@
-from abc import ABC
+from abc import ABC, abstractmethod
 import orjson
 import json
 import logging
 import os
 from pathlib import Path
 import time
-from typing import Any, Iterator, Literal, TextIO
+from typing import Any, Iterator, Literal, Self, TextIO
 import redis
 from pydantic import BaseModel
 
@@ -13,7 +13,7 @@ from pydantic import BaseModel
 logger = logging.getLogger(__name__)
 
 # If we try to read too often, the code will be to slow. Too rarely, and delays will be too big.
-_REREAD_DELAY = 0.01
+_REREAD_DELAY = 0.1
 # Every time we recheck if a stream is createed we print a warning, best not to do it too often.
 _RECHECK_DELAY = 3.0
 
@@ -65,16 +65,32 @@ class StreamRangeSpec(BaseModel):
 
 class StreamWriter(ABC):
 
+    @abstractmethod
+    def __enter__(self) -> Self:
+        pass
+
+    @abstractmethod
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    @abstractmethod
     def write(self, data: Any):
-        """Write data to the stream."""
-        raise NotImplementedError("Subclasses must implement this method.")
+        pass
     
 
 class StreamReader(ABC):
 
+    @abstractmethod
+    def __enter__(self) -> Self:
+        pass
+
+    @abstractmethod
+    def __exit__(self, exc_type, exc_value, traceback):
+        pass
+
+    @abstractmethod
     def read(self) -> Iterator[Any]:
-        """Read data from the stream."""
-        raise NotImplementedError("Subclasses must implement this method.")
+        pass
 
     
 # Redis-based streaming
@@ -83,11 +99,13 @@ def connect_to_redis(config: RedisConfig):
     """Connect to the Redis server.  Unlimited retries."""
     while True:
         try:
+            logger.info(f"Trying to connect to Redis server at {config.host}:{config.port}")
             client = redis.Redis(host=config.host, port=config.port)
-            logger.info(f"Connected to Redis server at {config.host}:{config.port}")            
+            client.ping()
+            logger.info(f"Connected to Redis server")            
             return client
         except redis.ConnectionError as e:
-            logger.info(f"Waiting for Redis server at {config.host}:{config.port}. Retrying in 5 seconds.")
+            logger.info(f"Waiting for Redis server. Retrying in 5 seconds.")
             time.sleep(5)
 
 
@@ -137,7 +155,7 @@ class RedisStreamReader(StreamReader):
     def __init__(self, stream: SingleStreamSpec):
         self.stream = stream
         assert isinstance(_backend, RedisConfig)
-        self._redis = redis.Redis(host=_backend.host, port=_backend.port)
+        self._redis = connect_to_redis(_backend)
         self._stream_name = str(self.stream)
         self._last_id = 0
         self._index = 0
@@ -162,9 +180,10 @@ class RedisStreamReader(StreamReader):
                 entry = {k.decode("utf-8"): v.decode("utf-8") for k, v in entry.items()}
                 if int(entry["index"]) != self._index:
                     raise ValueError(f"Index mismatch: expected {self._index}, got {entry['index']}")
-                yield entry["data"]
                 self._last_id = entry_id
-                self._index += 1
+                self._index += 1                
+                yield json.loads(entry["data"])
+
 
 
 class RoundRobinRedisStreamWriter(StreamWriter):
@@ -346,23 +365,6 @@ def read_stream(stream: SingleStreamSpec) -> StreamReader:
     elif _backend == "files":
         return FileStreamReader(stream)
     else:   
-        assert False
-
-
-def init_streams(streams: StreamSpec):
-    raise_if_backend_not_set()
-    if isinstance(_backend, RedisConfig):
-        logger.warning("Initialization makes no sense for Redis streams.")
-    elif _backend == "files":
-        if isinstance(streams, SingleStreamSpec):
-            with FileStreamWriter(streams, "w"):
-                pass
-        elif isinstance(streams, StreamRangeSpec):
-            with RoundRobinFileStreamWriter(streams, "w"):
-                pass
-        else:
-            raise ValueError(f"Invalid stream spec: {streams}")
-    else:
         assert False
 
 

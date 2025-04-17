@@ -50,8 +50,8 @@ from pipelinerl.utils import wait_for_inference_servers
 import pipelinerl.torch_utils
 from pipelinerl.streams import (
     SingleStreamSpec,
-    init_streams,
     read_stream,
+    set_streams_backend,
     write_to_streams,
 )
 
@@ -117,6 +117,7 @@ def sample_generator_fn(sample_queue):
             except Empty:
                 logger.info(f"Sample queue is empty, retrying with timeout {timeout}")
                 timeout = min(timeout * 1.5, 5.0)
+                yield None
         if isinstance(sample_or_exc, Exception):
             raise sample_or_exc
         assert isinstance(sample_or_exc, Dict)
@@ -136,6 +137,8 @@ def run_fixed_batch_data_loader(
             buffer = []
             while True:
                 entry = next(sample_generator)
+                if entry is None:
+                    continue
                 buffer.append(entry)
                 if len(buffer) == batch_size:
                     batch = collate(buffer, tokenizer=tokenizer)
@@ -174,7 +177,7 @@ def run_dynamic_batch_size_data_loader(
             while True:
                 # TODO: handle timeout
                 entry = next(sample_generator)
-                sample_length = len(entry["input_ids"])
+                sample_length = len(entry["input_ids"]) if entry else 0
 
                 if sample_length > max_seq_length:
                     raise ValueError(
@@ -203,10 +206,11 @@ def run_dynamic_batch_size_data_loader(
                     if boundary:
                         samples_in_step = 0
 
-                # add sample to current batch
-                current_batch.append(entry)
-                current_length += sample_length
-                samples_in_step += 1
+                if entry:
+                    # add sample to current batch
+                    current_batch.append(entry)
+                    current_length += sample_length
+                    samples_in_step += 1
 
         except Exception as e:
             logger.error(f"Error in dataset loader: {e}")
@@ -376,6 +380,8 @@ def validate_packing_config(args):
 def run_finetuning_loop(
     cfg: DictConfig,
 ):
+    set_streams_backend(**cfg.streams)
+
     dt = time.perf_counter()
     time_stats = {}
 
@@ -408,7 +414,6 @@ def run_finetuning_loop(
 
     # Render-vous with inference servers
     weight_update_stream = SingleStreamSpec(exp_path=exp_root_dir, topic="weight_update_request")
-    init_streams(weight_update_stream)
 
     # Logging
     if get_accelerator().is_main_process:
@@ -567,6 +572,7 @@ def run_finetuning_loop(
             weight_update_manager,
             tokenizer,
             training_metrics,
+            sample_queue,
             batch_queue,
         )
     finally:
@@ -583,6 +589,7 @@ def rl_finetuning_worker(
     weight_update_manager: WeightUpdateManager | None,
     tokenizer: PreTrainedTokenizerFast,
     training_metrics: TrainingMetrics,
+    sample_queue: Queue[Dict | Exception],
     batch_queue: Queue[VersionedTensors | Exception],
 ):
     local_samples = torch.tensor([0], device=get_accelerator().device)
@@ -763,7 +770,8 @@ def rl_finetuning_worker(
         # All gradients have been accumulated, we can now do an optimizer step
         training_metrics.completed_steps += 1
         training_metrics.samples = start_samples + total_samples
-        training_metrics.tokens += sum(tokens_processed) * get_accelerator().state.num_processes
+        this_worker_tokens = sum(tokens_processed)
+        training_metrics.tokens += this_worker_tokens * get_accelerator().state.num_processes
         if args.gradient_clipping_threshold:
             grad_norm = get_accelerator().clip_grad_norm_(model.parameters(), args.gradient_clipping_threshold)
             # grad_norm is None when using DeepSpeed
@@ -804,22 +812,23 @@ def rl_finetuning_worker(
                     "stats/epoch": training_metrics.epoch,
                     "stats/min_actor_version": lag_stats["min_version"],
                     "stats/max_actor_version": lag_stats["max_version"],
-                    "stats/queue_size": batch_queue.qsize(),
+                    "stats/queue_size": sample_queue.qsize(),
                     "stats/time_waiting_for_data": time_waiting_for_data,
                     "stats/lag": training_metrics.last_broadcasted_version - lag_stats["min_version"],
-                    "throughput/tokens_perGPU_per_sec": sum(tokens_processed) / sum(passes_took) if passes_took else 0,
-                    "throughput/tokens_per_step": sum(tokens_processed) * get_accelerator().state.num_processes,
+                    "throughput/tokens_perGPU_per_sec": this_worker_tokens / sum(passes_took) if passes_took else 0,
+                    "throughput/tokens_per_step": this_worker_tokens * get_accelerator().state.num_processes,
                     "throughput/micro_batches_per_step": len(tokens_processed),
                     "throughput/min_tokens_per_micro_batch": min(tokens_processed) if tokens_processed else 0,
                     "throughput/max_tokens_per_micro_batch": max(tokens_processed) if tokens_processed else 0,
-                    "throughput/tokens_per_micro_batch": sum(tokens_processed) / len(tokens_processed)
+                    "throughput/tokens_per_micro_batch": this_worker_tokens / len(tokens_processed)
                     if tokens_processed
                     else 0,
-                    "throughput/tokens_per_sec": sum(tokens_processed)
+                    "throughput/tokens_per_sec": this_worker_tokens
                     * get_accelerator().state.num_processes
                     / sum(passes_took)
                     if passes_took
                     else 0,
+                    "throughput/real_tokens_per_sec": this_worker_tokens / step_took,
                     "throughput/passes_per_sec": 1 / sum(passes_took) if passes_took else 0,
                     "throughput/steps_per_sec": 1 / step_took if step_took else 0,
                     "throughput/samples_per_sec": samples_per_step / sum(passes_took) if passes_took else 0, 

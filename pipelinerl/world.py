@@ -67,8 +67,6 @@ class WorldMap:
             if gpus:
                 self.job_map[node].append(Job(kind="finetune", replica_idx=node, node_rank=node, gpus=gpus))
 
-
-
         # Pretty-log the world map
         self._log_info("--- WORLD MAP ---")
         for node, jobs in self.job_map.items():
@@ -84,7 +82,11 @@ class WorldMap:
         # TODO: support nodes with less than 8 GPUs available
         total_gpus = self.world_size * self.node_size
         desired_actor_gpu_share = max(int(total_gpus * actor_fraction), self.gpus_per_llm)
-        desired_preprocessor_gpu_share = max(int(total_gpus * preprocessor_fraction), self.gpus_per_llm)
+        desired_preprocessor_gpu_share = (
+            max(int(total_gpus * preprocessor_fraction), self.gpus_per_llm)
+            if cfg.world.preprocessor_fraction
+            else 0
+        )
         desired_finetune_gpu_share = total_gpus - desired_actor_gpu_share - desired_preprocessor_gpu_share
         self._log_info(
             f"Desired GPU share: {desired_actor_gpu_share} for actors,"
@@ -159,6 +161,11 @@ class WorldMap:
                         local_idx=preprocessor_llm_idx, node_rank=node, gpus=gpus, url=ref_url
                     )
                 )
+        if not preprocessor_placed:
+            assert cfg.world.preprocessor_fraction == 0
+            self.job_map[self.world_size - 1].append(
+                Job(kind="preprocessor", replica_idx=0, node_rank=self.world_size - 1, gpus=[])
+            )
 
 
     def my_jobs(self) -> list[Job]:
