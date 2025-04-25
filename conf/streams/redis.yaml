@@ -1,0 +1,4 @@
+backend: redis
+# will be populated by the launcher
+host: null
+port: 11000
