@@ -1,10 +1,6 @@
 Pipeline RL
 =================
-<div align="center">
-
 [![Github](https://img.shields.io/badge/Blog%20Post-000000)](https://huggingface.co/blog/ServiceNow/pipelinerl/)
-
-</div>
 
 A scalable asynchronous reinforcement learning implementation with in-flight weight updates.
 
@@ -29,6 +25,8 @@ conda install redis-server==7.4.0 -c conda-forge
 ```
 
 # Run experiments
+
+To train Qwen 2.5 7B to solve math problems using [openreasoner](https://github.com/Open-Reasoner-Zero/Open-Reasoner-Zero) data, like we did it in our [blog post](https://huggingface.co/blog/ServiceNow/pipelinerl), follow the steps below.
 
 First, activate the conda environment:
 ```bash
