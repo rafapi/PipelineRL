@@ -4,6 +4,23 @@ defaults:
   - streams: files
   - _self_
 
+# Flag to control whether to use SGLang instead of vLLM
+use_sglang: false
+
+# SGLang-specific configuration (used when use_sglang is true)
+sglang:
+  master_address: "${env:MASTER_ADDR,localhost}"
+  master_port: ${world.actor_group_port}
+  group_name: "actor_update"
+  backend: "nccl"
+  model_config:
+    model_config:
+      tensor_parallel_size: 1
+      max_model_len: 8192
+    server_args:
+      max_num_seqs: 128
+      quantization: null
+
 finetune:
   use_flash_attention: true
   attn_implementation: flash_attention_2
@@ -43,6 +60,8 @@ actor:
   chunk_size: 8
   threads_per_llm: 32
   submit_delay: 0.
+  # For SGLang: number of ModelRunner instances per actor
+  num_replicas: 2
 preprocess:
   input: actor
   output: training_data

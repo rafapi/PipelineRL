@@ -41,6 +41,10 @@ class WorldMap:
 
         self._log_info(f"--- INITIALIZE WORLD MAP (this is rank {self.my_rank}) ---")
 
+        # Determine if we're using SGLang
+        self.use_sglang = cfg.get("use_sglang", False)
+        self._log_info(f"Using SGLang: {self.use_sglang}")
+
         llm_kwargs = self.cfg.vllm_config.vllm_kwargs
         tp = llm_kwargs.get("tensor-parallel-size", 1)
         pp = llm_kwargs.get("pipeline-parallel-size", 1)
@@ -124,23 +128,40 @@ class WorldMap:
     def _place_inference_jobs(self, cfg):
         actor_placed = False
         for worker_idx in range(cfg.world.actors):
+            # Place actor job
+            node = next((node for node in self.available_gpus if len(self.available_gpus[node]) >= self.gpus_per_llm), None)
+            if node is None:
+                raise ValueError("Not enough gpus to place all actors")
+            if not actor_placed:
+                self.job_map[node].append(
+                    Job(kind="actor", replica_idx=worker_idx, node_rank=node, gpus=[])
+                )
+                actor_placed = True
+            
+            # Place actor_llm or actor_sglang jobs based on config
             for actor_llm_idx in range(self.llms_per_actor):
                 node = next((node for node in self.available_gpus if len(self.available_gpus[node]) >= self.gpus_per_llm), None)
                 if node is None:
                     raise ValueError("Not enough gpus to place all actors")
-                if not actor_placed:
-                    self.job_map[node].append(
-                        Job(kind="actor", replica_idx=worker_idx, node_rank=node, gpus=[])
-                    )
-                    actor_placed = True
+                
                 gpus = [self.available_gpus[node].pop() for _ in range(self.gpus_per_llm)]
                 llm_url = f"http://{self.address_map[node]}:{8080 + actor_llm_idx}"
-                self.job_map[node].append(
-                    Job(
-                        kind="actor_llm", replica_idx=actor_llm_idx, 
-                        local_idx=actor_llm_idx, node_rank=node, gpus=gpus, url=llm_url
+                
+                # Create actor_sglang job if using SGLang, otherwise actor_llm
+                if self.use_sglang:
+                    self.job_map[node].append(
+                        Job(
+                            kind="actor_sglang", replica_idx=actor_llm_idx, 
+                            local_idx=actor_llm_idx, node_rank=node, gpus=gpus, url=llm_url
+                        )
                     )
-                )
+                else:
+                    self.job_map[node].append(
+                        Job(
+                            kind="actor_llm", replica_idx=actor_llm_idx, 
+                            local_idx=actor_llm_idx, node_rank=node, gpus=gpus, url=llm_url
+                        )
+                    )
 
         preprocessor_placed = False
         for worker_idx in range(cfg.world.preprocessors):
@@ -181,8 +202,11 @@ class WorldMap:
         return [job for jobs in self.job_map.values() for job in jobs]
 
     def get_actor_urls(self) -> list[str]:
+        """Get URLs for actor inference endpoints (vLLM or SGLang)"""
+        # For SGLang, use the same pattern as vLLM for URL compatibility
+        job_types = ["actor_sglang"] if self.use_sglang else ["actor_llm"]
         return [
-            job.url for job in self.get_all_jobs() if job.kind == "actor_llm"
+            job.url for job in self.get_all_jobs() if job.kind in job_types
         ]
     
     def get_preprocessor_urls(self) -> list[str]:

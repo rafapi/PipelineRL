@@ -132,6 +132,60 @@ def run_actor_llm(cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, loca
         )
 
 
+def run_actor_sglang(cfg: DictConfig, world_map: WorldMap, actor_llm_idx: int, local_idx: int, gpus: list[int], exp_dir: Path):
+    """
+    Run SGLang-based actor model runners.
+    
+    Args:
+        cfg: Configuration
+        world_map: World mapping
+        actor_llm_idx: Actor index
+        local_idx: Local index
+        gpus: GPUs to use
+        exp_dir: Experiment directory
+        
+    Returns:
+        Generator of Popen processes
+    """
+    finetune_model_path = exp_dir / "finetune" / "current"
+    if os.path.exists(finetune_model_path):
+        actor_model_path = finetune_model_path
+    else:
+        actor_model_path = cfg.model_path
+
+    log_dir = exp_dir / f"actor_sglang_{actor_llm_idx}"
+    os.makedirs(log_dir, exist_ok=True)
+    
+    # Create command for running SGLang model runner
+    cmd = [
+        "python", "-m", "pipelinerl.run_sglang_actor",
+        "--config-dir", f"{exp_dir}/conf",
+        "--config-name", "exp_config",
+        f"output_dir={exp_dir}",
+        f"hydra.run.dir={exp_dir}/actor_sglang_{actor_llm_idx}",
+        f"sglang.rank_offset={actor_llm_idx+1}",  # +1 because trainer is rank 0
+        f"sglang.master_address={world_map.master_addr}",
+        f"sglang.master_port={cfg.world.actor_group_port}",
+        f"sglang.world_size={world_map.weight_update_group_size}",
+    ]
+    
+    # If debug mode is enabled, disable weight updates
+    if cfg.debug.mode in ["actor", "open_loop"]:
+        cmd.append("debug.mode=actor")
+    
+    gpu_str = ",".join([str(gpu) for gpu in gpus])
+    logger.info(f"Running actor_sglang with command: {' '.join(cmd)} on gpus: {gpu_str}")
+    log_file_path = os.path.join(log_dir, f"stdout.log")
+    err_file_path = os.path.join(log_dir, f"stderr.log")
+    with open(log_file_path, "a") as log_file, open(err_file_path, "a") as err_file:
+        yield _popen(
+            cmd,
+            env={**os.environ, "CUDA_VISIBLE_DEVICES": gpu_str},
+            stdout=log_file,
+            stderr=err_file,
+        )
+
+
 def run_actor(world_map: WorldMap, actor_idx: int, exp_dir: Path):
     if actor_idx != 0:
         raise NotImplementedError("Can only do 1 actor yet")
@@ -233,6 +287,11 @@ def run_finetune(cfg: DictConfig, world_map: WorldMap, gpus: list[int], exp_dir:
         f"+me.weight_update_group_world_size={world_map.weight_update_group_size}",        
         f"+me.llm_urls={'+'.join(world_map.get_actor_urls())}",
     ]
+    
+    # Add SGLang-specific flag if we're using SGLang
+    if cfg.get("use_sglang", False):
+        cmd.append("+sglang_model=true")
+    
     if cfg.debug.mode in ["finetune", "open_loop"]:
         cmd.append("finetune.send_weight_updates=False")
     
@@ -359,7 +418,7 @@ def debug_link_streams(cfg: DictConfig, topics: list[str]):
 def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | None = None):
     exp_dir = Path(cfg.output_dir)
     processes = []
-    all_job_kinds = ["actor", "actor_llm", "preprocessor", "preprocessor_llm", "finetune"]
+    all_job_kinds = ["actor", "actor_llm", "actor_sglang", "preprocessor", "preprocessor_llm", "finetune"]
     if job_kind_filter is None:
         job_kind_filter = all_job_kinds
     for job in world_map.my_jobs():
@@ -370,7 +429,13 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
         if job.kind == "actor":
             processes.extend(run_actor(world_map, job.replica_idx, exp_dir))
         elif job.kind == "actor_llm":
-            processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
+            # Use SGLang instead of vLLM if configured
+            if cfg.get("use_sglang", False):
+                processes.extend(run_actor_sglang(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
+            else:
+                processes.extend(run_actor_llm(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
+        elif job.kind == "actor_sglang":
+            processes.extend(run_actor_sglang(cfg, world_map, job.replica_idx, job.local_idx, job.gpus, exp_dir))
         elif job.kind == "preprocessor":
             processes.extend(run_preprocess(world_map, job.replica_idx, exp_dir))
         elif job.kind == "preprocessor_llm":
@@ -456,7 +521,10 @@ def main(cfg: DictConfig):
     if cfg.debug.mode == "finetune":
         processes.extend(launch_jobs(cfg, world_map, ["finetune"]))
     elif cfg.debug.mode == "actor":
-        processes.extend(launch_jobs(cfg, world_map, ["actor", "actor_llm"]))
+        if cfg.get("use_sglang", False):
+            processes.extend(launch_jobs(cfg, world_map, ["actor", "actor_sglang"]))
+        else:
+            processes.extend(launch_jobs(cfg, world_map, ["actor", "actor_llm"]))
     elif cfg.debug.mode == "preprocessor":
         processes.extend(launch_jobs(cfg, world_map, ["preprocessor", "preprocessor_llm"]))
     elif cfg.debug.mode in ["", "open_loop"]:
