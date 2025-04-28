@@ -53,3 +53,15 @@ python -m pipelinerl.launch streams=redis output_dir=results/base1
 ```
 
 Multi node: coming soon.
+
+## PipelineRL configuration explained
+
+Some key hyperparameters:
+- `attempts`: the number of attempts per prompt / reasoning problem
+- `finetune.seq_length`: maximum number of tokens per micro-batch, if you are using `finetune.seq_packing=true` which is the default
+- `finetune.train_batch_size`: 
+    - if `finetune.seq_packing=false`, the number of samples in each micro-batch.
+    - if `finetune.seq_packing=true`, see the explanation of `finetune.gradient_accumulation_passes` below
+- `finetune.gradient_accumulation_passes`
+    -  if `finetune.seq_packing=false`: the total number of micro-batches per batch for all training workers
+    -  if `finetune.seq_packing=true`: take this number and multiply it by `finetune.train_batch_size` to get the total batch size per optimizer step for all training workers 
