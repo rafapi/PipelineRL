@@ -384,14 +384,11 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
 
 def setup_logging(log_dir: Path, log_level: int = logging.INFO):
     os.makedirs(log_dir, exist_ok=True)
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        handlers=[
-            logging.FileHandler(log_dir / "launcher.log"),
-            logging.StreamHandler(),
-        ],
-    )
+    file_handler = logging.FileHandler(log_dir / "launcher.log")
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
     logger.info("Logging setup complete")
 
 
