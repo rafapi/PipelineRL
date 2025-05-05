@@ -382,9 +382,8 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
     return processes
 
 
-def setup_logging(log_dir: Path):
-    os.makedirs(log_dir, exist_ok=True)
-    file_handler = logging.FileHandler(log_dir / "launcher.log")
+def setup_logging(log_file: Path):
+    file_handler = logging.FileHandler(log_file)
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
     root_logger = logging.getLogger()
@@ -404,8 +403,9 @@ def main(cfg: DictConfig):
     exp_dir = Path(cfg.output_dir)    
     config_dir = exp_dir / "conf"
 
-    log_dir = exp_dir / "launcher"
-    setup_logging(log_dir)
+    os.makedirs(exp_dir / "launcher", exist_ok=True)
+    log_file = exp_dir / "launcher" / f"launcher_{world_map.my_rank}.log"
+    setup_logging(log_file)
 
     group = str(exp_dir)
     root = cfg.finetune.wandb_workspace_root
