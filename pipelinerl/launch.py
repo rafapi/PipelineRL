@@ -382,7 +382,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
     return processes
 
 
-def setup_logging(log_dir: Path, log_level: int = logging.INFO):
+def setup_logging(log_dir: Path, log_level: int = logging.DEBUG):
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=log_level,
@@ -408,7 +408,7 @@ def main(cfg: DictConfig):
     config_dir = exp_dir / "conf"
 
     log_dir = exp_dir / "launcher"
-    setup_logging(log_dir, cfg.debug.log_level)
+    setup_logging(log_dir)
 
     group = str(exp_dir)
     root = cfg.finetune.wandb_workspace_root
