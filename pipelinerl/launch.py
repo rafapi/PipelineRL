@@ -382,7 +382,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
     return processes
 
 
-def setup_logging(log_dir: Path, log_level: int = logging.DEBUG):
+def setup_logging(log_dir: Path, log_level: int = logging.INFO):
     os.makedirs(log_dir, exist_ok=True)
     logging.basicConfig(
         level=log_level,
