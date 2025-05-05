@@ -28,7 +28,8 @@ logger = logging.getLogger(__name__)
 
 RL_DATA_COLUMNS = [
     "reward",
-    "example_weight",
+    "overflow",
+    "group_tokens",
     "rewards",
     "advantages",
     "old_logprobs",
@@ -43,6 +44,7 @@ class RLConfig(BaseModel):
         description="Use advantages instead of rewards to compute the loss",
     )
     epsilon: float = Field(default=0.2, description="Clip parameter for the ration of log probs")
+    batch_size: int = Field(default=0, description="Batch size is required for normalization")
     reward_minus_kl_coef: float = Field(
         default=0.0,
         # https://arxiv.org/abs/2402.14740
@@ -72,13 +74,13 @@ class RLConfig(BaseModel):
         default=10,
         description="Clamp the log ratio ref new value",
     )
-    aggregate_loss: Literal["mean", "sum"] = Field(
-        default="sum",
-        description="How to aggregate the loss within a batch (when batch size is 1, there is no difference)",
-    )
     overlong_filtering: bool = Field(
         default=False,
         description="Filter out sequence that do not have eos_token_id"
+    )
+    group_normalization: bool = Field(
+        default=False,
+        description="Divide the weight of each sequence by the (average) number of tokens in the group"
     )
     temperature: float = Field(
         default=1.0,
@@ -189,7 +191,19 @@ def rl_step(
     advantages = batch.pop("advantages")[:, 1:]
     ref_logprobs = batch["ref_logprobs"][:, 1:]
     old_logprobs = batch["old_logprobs"][:, 1:]
-    examples_weights = batch["example_weight"][:, 1:]
+    group_tokens = batch["group_tokens"][:, 1:]
+    overflow = batch["overflow"][:, 1:]
+
+    if config.group_normalization:
+        tokens_weights = torch.ones_like(group_tokens) / group_tokens
+    else:
+        tokens_weights = torch.ones_like(group_tokens) / config.batch_size 
+    
+    if config.overlong_filtering:
+        # filter out sequences that do not have eos_token_id
+        overflow = torch.tensor(overflow, device=overflow.device)
+        tokens_weights = tokens_weights * (1 - overflow)
+    
     assert new_logprobs.shape == ref_logprobs.shape
 
     log_ratio_new_old = new_logprobs - old_logprobs
@@ -234,15 +248,10 @@ def rl_step(
 
     # combine loss components
     loss = policy_loss - kl_coef * approx_kl + entropy_bonus_coef * entropy  # 1 x (BxL) x 1
-    assert loss.shape == examples_weights.shape, f"Loss shape {loss.shape} does not match example weights shape {examples_weights.shape}"
-    loss = loss * examples_weights  # 1 x (BxL) x 1
+    assert loss.shape == tokens_weights.shape, f"Loss shape {loss.shape} does not match example weights shape {tokens_weights.shape}"
+    loss = loss * tokens_weights  # 1 x (BxL) x 1
 
-    if config.aggregate_loss == "mean":
-        final_loss = -mean_sum(loss, masks_shifted, segments)
-    elif config.aggregate_loss == "sum":
-        final_loss = -sum_sum(loss, masks_shifted, segments)
-    else:
-        raise ValueError(f"{config.aggregate_loss} is not defined")
+    final_loss = -sum_sum(loss, masks_shifted, segments)
 
     # ensure loss is valid
     assert torch.isfinite(final_loss), f"Non-finite loss detected: {final_loss}"
@@ -274,7 +283,7 @@ def rl_step(
         "clamp_log_ratio_ref_new_indicator": mean_sum(clamp_log_ratio_ref_new_indicators, masks_shifted, segments).item(),
         "clamp_log_ratio_new_old_indicator": mean_sum(clamp_log_ratio_new_old_indicators, masks_shifted, segments).item(),
         "num_nans": torch.isnan(loss).sum().item(),
-        "example_weight": mean_sum(examples_weights, masks_shifted, segments).item(),
+        "token_weight": mean_sum(tokens_weights, masks_shifted, segments).item(),
         "kl_coef": num_sequences * kl_coef,
         "entropy_bonus_coef": num_sequences * entropy_bonus_coef,
     }
@@ -282,19 +291,25 @@ def rl_step(
     return final_loss, stats
 
 
-def update_rewards_and_advantages(dataset: Dataset, config: RLConfig) -> Dataset:
+def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
     """
-    Updates the advantages column in the given dataset based on reward statistics.
-
+    Populates a dataset with reinforcement learning specific data columns including
+    rewards, advantages, and token weights.
+    
     Args:
-        dataset (Dataset): The input dataset containing rewards and placeholder advantages.
-
+        dataset (Dataset): The input dataset to populate with RL data
+        eos_token_id (int): End of sequence token ID
+        config (RLConfig): Configuration object containing RL training parameters
+        
     Returns:
-        Dataset: The updated dataset with the updated advantages column.
-
+        Dataset: The dataset populated with RL-specific columns
     """
+    logger.debug("Populate RL Data")
+    
+    # Convert to pandas for processing
     df = dataset.to_pandas()
-
+    
+    # Update rewards with implicit KL if needed
     if config.reward_minus_kl_coef > 0:
         logger.info("Updating Reward with Implicit KL")
         calculate_rewards_with_implicit_kl_ = partial(
@@ -302,68 +317,37 @@ def update_rewards_and_advantages(dataset: Dataset, config: RLConfig) -> Dataset
         )
         df["rewards"] = df.apply(calculate_rewards_with_implicit_kl_, axis=1)
         df["reward"] = df["rewards"].apply(lambda x: np.mean(x))
+    
+    # Combined groupby for both reward statistics and token calculations
+    grouped = df.groupby("group_id").agg(
+        reward_mean=("reward", "mean"),
+        reward_std=("reward", "std"),
+        new_group_tokens=("input_ids", lambda x: sum(len(tokens) for tokens in x) / len(x))
+    ).reset_index()
 
-    # Group by group_id and compute mean and std of reward
-    grouped = df.groupby("group_id")["reward"].agg(["mean", "std", "count"]).reset_index()
+    # Single merge to bring all statistics back
+    df = pd.merge(df, grouped, on="group_id", how="left")
 
-    # Rename columns for clarity
-    grouped.columns = ["group_id", "reward_mean", "reward_std", "count"]
-
-    # Merge the computed statistics back to the original dataset
-    df_with_stats = pd.merge(df, grouped, on="group_id", how="left")
-
-    df_with_stats["advantages"] = df_with_stats.apply(calculate_advantage, axis=1)
-
-    # replace advantages entry
-    dataset = replace_dataset_column(dataset, "advantages", df_with_stats["advantages"].tolist())
-
-    # Convert back to a Hugging Face Dataset
-    return dataset
-
-
-def assign_example_weights(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
-    """
-    Assigns example weights to the dataset based on the reward column.
-
-    Args:
-        dataset (Dataset): The input dataset containing rewards.
-        config (RLConfig): Configuration object containing RL training parameters
-
-    Returns:
-        Dataset: The updated dataset with the assigned example weights.
-    """
-    df = dataset.to_pandas()
-
-    def compute_weight(row):
-        if eos_token_id not in row["input_ids"] and config.overlong_filtering:
-            return [0.0] * len(row["example_weight"])
-        else:
-            return [1.0] * len(row["example_weight"])
-
-    df["example_weight"] = df.apply(compute_weight, axis=1)
-    dataset = replace_dataset_column(dataset, "example_weight", df["example_weight"].tolist())
-    return dataset
-
-
-def populate_rl_data(dataset: Dataset, eos_token_id: int, config: RLConfig) -> Dataset:
-    """
-    Populates a dataset with reinforcement learning specific data columns.
-
-    Args:
-        dataset (Dataset): The input dataset to populate with RL data
-        columns (list[str]): List of column names to include in the dataset
-        collate_fn (Callable): Function to collate/batch the data
-        config (RLConfig): Configuration object containing RL training parameters
-
-    Returns:
-        Dataset: The dataset populated with RL-specific columns including rewards and advantages
-    """
-
-    logger.debug("Populate RL Data")
-
-    dataset = update_rewards_and_advantages(dataset, config)
-    dataset = assign_example_weights(dataset, eos_token_id, config)
-
+    # Calculate advantages
+    df["advantages"] = df.apply(calculate_advantage, axis=1)
+    
+    # Handle overflow
+    df["overflow"] = df.apply(
+        lambda row: [0.0] * len(row["overflow"]) if eos_token_id in row["input_ids"] else [1.0] * len(row["overflow"]), 
+        axis=1
+    )
+    
+    # Broadcast group tokens
+    df["new_group_tokens"] = df.apply(
+        lambda row: [row["new_group_tokens"]] * len(row["input_ids"]), 
+        axis=1
+    )
+    
+    # Replace columns in the dataset
+    dataset = replace_dataset_column(dataset, "advantages", df["advantages"].tolist())
+    dataset = replace_dataset_column(dataset, "group_tokens", df["new_group_tokens"].tolist())
+    dataset = replace_dataset_column(dataset, "overflow", df["overflow"].tolist())
+    
     logger.debug("Finish Populate RL Data")
     return dataset
 
@@ -386,5 +370,6 @@ def prepare_rl_fields(
     encoding["advantages"] = [0.0] * len(encoding["labels"])  # place holder
     encoding["old_logprobs"] = [0] * (len(encoding["labels"]) - len(old_logprobs)) + old_logprobs
     encoding["ref_logprobs"] = [0] * (len(encoding["labels"]) - len(ref_logprobs)) + ref_logprobs
-    encoding["example_weight"] = [0] * len(encoding["labels"]) # place holder
+    encoding["overflow"] = [0] * len(encoding["labels"]) # place holder
+    encoding["group_tokens"] = [0] * len(encoding["labels"]) # place holder
     return encoding
