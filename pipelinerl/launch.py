@@ -399,8 +399,32 @@ def main(cfg: DictConfig):
     file_handler = logging.FileHandler(exp_dir / "launcher" / "launcher.log")
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
     file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.INFO)
+    
+    # Configure the root logger
     root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+    
+    # Remove any existing handlers from the root logger to avoid duplication
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+    
+    # Add the file handler to the root logger
     root_logger.addHandler(file_handler)
+    
+    # Also add a console handler to maintain console output
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.INFO)
+    root_logger.addHandler(console_handler)
+    
+    # Make sure the pipelinerl loggers inherit from the root logger
+    for name in logging.root.manager.loggerDict:
+        if name.startswith('pipelinerl'):
+            logger_instance = logging.getLogger(name)
+            logger_instance.handlers = []  # Clear any existing handlers
+            logger_instance.propagate = True  # Ensure propagation to the root logger
+    
 
     group = str(exp_dir)
     root = cfg.finetune.wandb_workspace_root
