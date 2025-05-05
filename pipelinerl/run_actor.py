@@ -268,7 +268,6 @@ class ActorLoop:
         self.stats_stream = stats_stream
         self.window_size = 500 // cfg.attempts
         self.stats_aggregator = SlidingWindowAggregator(window_size=self.window_size)
-        self.sampling_cfg = cfg.actor.sampling
         self.llms = llms
         # Can't use typing with multiprocessing.
         # Queue of dict or None
