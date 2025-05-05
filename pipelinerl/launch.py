@@ -395,6 +395,12 @@ def main(cfg: DictConfig):
     exp_dir = Path(cfg.output_dir)    
     config_dir = exp_dir / "conf"
 
+    os.makedirs(exp_dir / "launcher", exist_ok=True)
+    file_handler = logging.FileHandler(exp_dir / "launcher" / "launcher.log")
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
 
     group = str(exp_dir)
     root = cfg.finetune.wandb_workspace_root
