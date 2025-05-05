@@ -7,6 +7,7 @@ import requests
 from datasets import load_dataset
 from tqdm import tqdm
 from tapeagents.core import LLMCall, StepMetadata, TrainingText
+from tapeagents.llms.trainable import TrainableLLM
 from pipelinerl.finetune.data import MASKED_TOKEN_ID
 from pipelinerl.verifier_api import verify_answer
 from .cot_math_agent import CoTMathAgent, RLMathTape, Task
@@ -167,4 +168,5 @@ def extract_tape_training_samples(
         "overflows": sum(overflows),
     }
     return training_samples, tape_stats
+
 
