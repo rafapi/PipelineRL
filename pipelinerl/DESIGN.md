@@ -11,7 +11,7 @@
 - the agent runner thread call the APIs, evaluates the tapes, and publishes data and stats in a queue
 - the main thread reads the queue, write to the filesystem and to wandb
 - another thread will listen on the LLM and Trainer status
-- the main thread will stop putting tasks in the queue when it sees that LLM weight update is
+- the main thread will stop putting tasks in the queue when it sees that LLM weight update is pending and max allowed lag is reached
 
 # Preprocessor
 - takes input from streams produced by the actor
