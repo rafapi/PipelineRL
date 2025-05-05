@@ -382,7 +382,7 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
     return processes
 
 
-def setup_logging(log_dir: Path, log_level: int = logging.INFO):
+def setup_logging(log_dir: Path):
     os.makedirs(log_dir, exist_ok=True)
     file_handler = logging.FileHandler(log_dir / "launcher.log")
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
