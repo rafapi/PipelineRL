@@ -326,7 +326,7 @@ def run_preprocessing_loop(
 
     submitted_chunks = 0
     processed_chunks = 0
-    worker_pool_size = cfg.preprocess.threads_per_llm * max(len(llms), 1)
+    worker_pool_size = cfg.preprocess.n_workers
     next_llm_index = 0
 
     stats_aggregator = SlidingWindowAggregator(window_size=500 // cfg.preprocess.chunk_size)
@@ -340,7 +340,7 @@ def run_preprocessing_loop(
             dummy = entry_size * b" " 
             dataset_queue = manager.Queue(max_dataset_queue_size)
             io_buffer = smm.ShareableList([dummy] * buffer_size)
-            logger.info(f"Shared memory buffer size: {buffer_size} * {entry_size} bytes")
+            logger.info(f"Shared memory buffer size: {buffer_size * entry_size / 2 ** 30} Gb")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
