@@ -9,7 +9,7 @@ import queue
 import time
 
 from litellm import BaseModel, Field
-import orjson
+import pickle
     
 from pipelinerl.utils import wait_for_inference_servers
 from pipelinerl.world import WorldMap
@@ -257,7 +257,7 @@ def process_chunk(
     dataset_queue: Queue,
 ):
     try:
-        chunk = orjson.loads(io_buffer[slot])
+        chunk = pickle.loads(io_buffer[slot])
         dataset = preprocess_dataset(
             llm=llm,
             data=chunk,
@@ -265,11 +265,11 @@ def process_chunk(
             seq_length=seq_length,
             rl_config=rl_config,
         )
-        io_buffer[slot] = orjson.dumps([entry for entry in dataset])
+        io_buffer[slot] = pickle.dumps([entry for entry in dataset])
         dataset_queue.put(slot)
     except Exception as e:
         logger.error(f"Failed to preprocess chunk: {e}")
-        io_buffer[slot] = orjson.dumps(e)
+        io_buffer[slot] = pickle.dumps(e)
 
 
 def run_preprocessing_loop(
@@ -331,29 +331,30 @@ def run_preprocessing_loop(
 
     stats_aggregator = SlidingWindowAggregator(window_size=500 // cfg.preprocess.chunk_size)
 
-    last_submit = 0
     with write_to_streams(output_stream) as writer, write_to_streams(stats_streams) as stats_writer:
         with mp.Manager() as manager, SharedMemoryManager() as smm:
-            dataset_queue = manager.Queue()
-            buffer_size = 1000
+            max_dataset_queue_size = 128
+            max_pool_tasks = 2 * worker_pool_size
+            buffer_size = 2 * max_pool_tasks + max_dataset_queue_size
             entry_size = 5000000
             dummy = entry_size * b" " 
+            dataset_queue = manager.Queue(max_dataset_queue_size)
             io_buffer = smm.ShareableList([dummy] * buffer_size)
+            logger.info(f"Shared memory buffer size: {buffer_size} * {entry_size} bytes")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
                     try:
-                        llm = llms[next_llm_index] if llms else None
+                        loop_start = time.time()
 
-                        now = time.time()
-                        waited_enough = not llms or now - last_submit > cfg.preprocess.submit_delay / len(llms)
-                        if waited_enough and submitted_chunks - processed_chunks < worker_pool_size:
+                        llm = llms[next_llm_index] if llms else None
+                        if submitted_chunks - processed_chunks < max_pool_tasks:
                             try:
-                                raw_chunk = raw_chunk_queue.get(timeout=0.01)
+                                raw_chunk = raw_chunk_queue.get(timeout=0.001)
                                 if isinstance(raw_chunk, Exception):
                                     raise raw_chunk
                                 slot = submitted_chunks % buffer_size
-                                io_buffer[slot] = orjson.dumps(raw_chunk)
+                                io_buffer[slot] = pickle.dumps(raw_chunk)
                                 future = executor.submit(
                                     process_chunk, 
                                     llm, io_buffer, submitted_chunks % buffer_size, tokenizer,
@@ -368,20 +369,19 @@ def run_preprocessing_loop(
                                     else None
                                 )
                                 submitted_chunks += 1
-                                last_submit = now
                                 next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
+                                logger.info(f"Scheduled a chunk, took {time.time() - loop_start:.3f}s")
                             except Empty:
                                 pass
 
+                        start_processing = time.time()
                         try:
                             # Try to write the next dataset to the output stream, if it is ready
-                            before  = time.time()
-                            pointer = dataset_queue.get(timeout=0.01)
-                            dataset = orjson.loads(io_buffer[pointer])
-                            fetching_took = time.time() - before                            
+                            pointer = dataset_queue.get(timeout=0.001)
+                            dataset = pickle.loads(io_buffer[pointer])
+                            fetching_took = time.time() - start_processing                            
                         except Empty:
                             continue
-                        start_processing = time.time()
                         if isinstance(dataset, Exception):
                             raise dataset
                         start_writing = time.time()
