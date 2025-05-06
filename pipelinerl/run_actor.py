@@ -1,5 +1,7 @@
+import pickle
 import logging
 import math
+from multiprocessing.managers import SharedMemoryManager
 import os
 import queue
 import random
@@ -109,6 +111,7 @@ async def schedule_rollouts(
     attempts: int, 
     problem_queue: mp.Queue, 
     result_queue: mp.Queue, 
+    io_buffer, 
     trainer_state: TrainerState,
     llms: list[TrainableLLM],
     scheduler_name: str,
@@ -134,6 +137,7 @@ async def schedule_rollouts(
 
     async def rollout_and_maybe_produce_result(
         problem: dict, 
+        slot: int,
         group_id: int,
         llm_index: int, 
         session: aiohttp.ClientSession,
@@ -156,7 +160,8 @@ async def schedule_rollouts(
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
                 random.shuffle(group_rollouts[group_id]) 
-                result_queue.put(group_rollouts[group_id])
+                io_buffer[slot] = pickle.dumps(group_rollouts[group_id])
+                result_queue.put(slot)
                 del group_rollouts[group_id]
             finished_rollouts += 1
         except Exception as e:
@@ -166,7 +171,8 @@ async def schedule_rollouts(
             for task in asyncio.all_tasks(loop=loop):
                 if task != current_task:
                     task.cancel()
-            result_queue.put(e)
+            io_buffer[slot] = pickle.dumps(e)
+            result_queue.put(slot)
             logger.error("Stopped all tasks and put exception in the result queue")
         finally:
             active_rollouts[llm_index] -= 1
@@ -174,6 +180,7 @@ async def schedule_rollouts(
     group_id = -1
     group_rollout_index = attempts
     problem = None
+    slot = None
 
     last_logged = time.time()
     logger.info("Starting rollout scheduler")
@@ -191,7 +198,8 @@ async def schedule_rollouts(
 
             if group_rollout_index == attempts:
                 try:
-                    problem = problem_queue.get_nowait()
+                    slot = problem_queue.get_nowait()
+                    problem = pickle.loads(io_buffer[slot])
                 except queue.Empty:
                     # give some quality time for other couroutines to work
                     await asyncio.sleep(0.01)
@@ -207,9 +215,11 @@ async def schedule_rollouts(
                 continue 
             active_rollouts[next_llm] += 1
             started_rollouts += 1
+            assert problem is not None and slot is not None
             loop.create_task(
                 rollout_and_maybe_produce_result(
                     problem=problem,
+                    slot=slot,
                     group_id=group_id,
                     llm_index=next_llm,
                     session=session,
@@ -224,6 +234,7 @@ def rollout_maker_entrypoint(
     attempts: int,
     problem_queue: mp.Queue,
     result_queue: mp.Queue,
+    io_buffer,
     llms: list[TrainableLLM],
     scheduler_name: str,
 ):
@@ -236,7 +247,7 @@ def rollout_maker_entrypoint(
     loop = uvloop.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(
-        schedule_rollouts(cfg, attempts, problem_queue, result_queue, trainer_state, llms, scheduler_name)
+        schedule_rollouts(cfg, attempts, problem_queue, result_queue, io_buffer, trainer_state, llms, scheduler_name)
     )    
     loop.close()
     logger.info("Rollout maker loop closed")
@@ -269,11 +280,6 @@ class ActorLoop:
         self.window_size = 500 // cfg.attempts
         self.stats_aggregator = SlidingWindowAggregator(window_size=self.window_size)
         self.llms = llms
-        # Can't use typing with multiprocessing.
-        # Queue of dict or None
-        self.problem_queue = mp.Queue(32)
-         # Queue of list[RolloutResult] or Exception 
-        self.result_queue = mp.Queue()    
         self.loop_start_time = -1
         self.cfg = cfg
         self.is_training = is_training
@@ -288,6 +294,21 @@ class ActorLoop:
         for i, llm in enumerate(self.llms):
             llm_groups[i % num_processes].append((i, llm))
         
+        self.smm = SharedMemoryManager()
+        self.smm.start()
+
+        entry_size = 1000000 * attempts
+        self.max_groups_in_progress = 2 * len(self.llms) * ((cfg.actor.llm_max_rollouts + attempts - 1) // attempts)
+        max_ready_groups_waiting = 128
+        self.problem_queue = mp.Queue()
+        self.result_queue = mp.Queue(max_ready_groups_waiting)
+        self.buffer_size = self.max_groups_in_progress + max_ready_groups_waiting
+        self.io_buffer = self.smm.ShareableList([entry_size * b" "] * self.buffer_size)
+        self.free_slots = set(range(self.buffer_size))
+        logger.info(f"Initialized {'train' if self.is_training else 'test'} actor loop")
+        logger.info(f"Max groups in progress: {self.max_groups_in_progress}, buffer size: {self.buffer_size}")
+        logger.info(f"Shared memory buffer size: {self.buffer_size * entry_size / 2 ** 30} Gb")
+
         # Create and start multiple rollout processes
         self.rollout_processes = []
         for llm_group in llm_groups:
@@ -297,7 +318,7 @@ class ActorLoop:
             scheduler_name = f"{'train' if is_training else 'test'} scheduler for llms {','. join([str(i) for i in llm_idxs])}"
             process = mp.Process(
                 target=rollout_maker_entrypoint,
-                args=(self.cfg, attempts, self.problem_queue, self.result_queue, llms, scheduler_name)
+                args=(self.cfg, attempts, self.problem_queue, self.result_queue, self.io_buffer, llms, scheduler_name)
             )
             process.start()
             self.rollout_processes.append(process)
@@ -390,10 +411,14 @@ class ActorLoop:
                         blocked_by_lag = (
                             submitted_groups == can_submit_before_update and self.is_training
                         )
-                        if not blocked_by_lag and not self.problem_queue.full():
+                        in_progress = submitted_groups - finished_groups
+                        assert 0 <= in_progress and in_progress <= self.max_groups_in_progress
+                        if not blocked_by_lag and in_progress < self.max_groups_in_progress:
                             try:
                                 problem = next(problem_iter)
-                                self.problem_queue.put_nowait(problem)  
+                                slot = self.free_slots.pop()
+                                self.io_buffer[slot] = pickle.dumps(problem)
+                                self.problem_queue.put_nowait(slot)  
                                 submitted_groups += 1
                             except StopIteration:
                                 break
@@ -402,7 +427,9 @@ class ActorLoop:
 
                 # Second, try return a result
                 try:
-                    rollout_results = self.result_queue.get_nowait()
+                    slot = self.result_queue.get_nowait()
+                    rollout_results = pickle.loads(self.io_buffer[slot])
+                    self.free_slots.add(slot)
                     if isinstance(rollout_results, Exception):
                         logger.error("Stop actor loop due to error")
                         raise rollout_results
