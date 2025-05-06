@@ -345,8 +345,6 @@ def run_preprocessing_loop(
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
                     try:
-                        loop_start = time.time()
-
                         llm = llms[next_llm_index] if llms else None
                         if submitted_chunks - processed_chunks < max_pool_tasks:
                             try:
@@ -370,7 +368,6 @@ def run_preprocessing_loop(
                                 )
                                 submitted_chunks += 1
                                 next_llm_index = (next_llm_index + 1) % len(llms) if llms else 0
-                                logger.info(f"Scheduled a chunk, took {time.time() - loop_start:.3f}s")
                             except Empty:
                                 pass
 
