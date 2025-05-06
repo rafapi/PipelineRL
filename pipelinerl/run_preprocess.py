@@ -1,10 +1,15 @@
+import os
+os.environ["HF_DATASETS_DISABLE_PROGRESS_BARS"] = "1"
+
 import multiprocessing as mp
+from multiprocessing.managers import SharedMemoryManager
 from concurrent.futures import ProcessPoolExecutor
 import logging
 import queue
 import time
 
 from litellm import BaseModel, Field
+import orjson
     
 from pipelinerl.utils import wait_for_inference_servers
 from pipelinerl.world import WorldMap
@@ -37,7 +42,6 @@ from pipelinerl.streams import (
 )
 
 logger = logging.getLogger(__name__)
-TOKEN_IDS = None
 
 
 def _check_group_sizes(texts: list[dict], group_size: int) -> bool:
@@ -245,13 +249,15 @@ class SlidingWindowAggregator:
 
 def process_chunk(
     llm: TrainableLLM,
-    chunk: list[dict],
+    io_buffer,
+    slot: int,
     tokenizer: transformers.PreTrainedTokenizerBase,
     seq_length: int,
     rl_config: RLConfig,
-    dataset_queue: queue.Queue,
+    dataset_queue: Queue,
 ):
     try:
+        chunk = orjson.loads(io_buffer[slot])
         dataset = preprocess_dataset(
             llm=llm,
             data=chunk,
@@ -259,15 +265,11 @@ def process_chunk(
             seq_length=seq_length,
             rl_config=rl_config,
         )
-        try:
-            dataset_queue.put_nowait(dataset)
-        except queue.Full:
-            logger.warning(f"We are preprocessing the data faster than we can write it to the filesystem")
-            dataset_queue.put(dataset)
+        io_buffer[slot] = orjson.dumps([entry for entry in dataset])
+        dataset_queue.put(slot)
     except Exception as e:
         logger.error(f"Failed to preprocess chunk: {e}")
-        dataset_queue.put(e)
-
+        io_buffer[slot] = orjson.dumps(e)
 
 
 def run_preprocessing_loop(
@@ -275,7 +277,7 @@ def run_preprocessing_loop(
 ):
     set_streams_backend(**cfg.streams)
 
-    world_map = WorldMap(cfg)
+    world_map = WorldMap(cfg, verbose=True)
     exp_root_dir = Path(cfg.output_dir)
 
     run = init_wandb(cfg, exp_root_dir / "preprocessor", flatten_dict_config(cfg))
@@ -292,7 +294,7 @@ def run_preprocessing_loop(
     output_stream = StreamRangeSpec(
         exp_path=exp_root_dir,
         topic=cfg.preprocess.output,
-        partition_range=(0, world_map.total_finetune_gpus),
+        partition_range=(0, max(world_map.total_finetune_gpus, 1)),
     )
     stats_streams = SingleStreamSpec(exp_path=exp_root_dir, topic="preprocessor_stats")
     logger.info(f"Streams initialized")
@@ -331,8 +333,12 @@ def run_preprocessing_loop(
 
     last_submit = 0
     with write_to_streams(output_stream) as writer, write_to_streams(stats_streams) as stats_writer:
-        with mp.Manager() as manager:
+        with mp.Manager() as manager, SharedMemoryManager() as smm:
             dataset_queue = manager.Queue()
+            buffer_size = 1000
+            entry_size = 5000000
+            dummy = entry_size * b" " 
+            io_buffer = smm.ShareableList([dummy] * buffer_size)
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
                 while True:
@@ -346,9 +352,11 @@ def run_preprocessing_loop(
                                 raw_chunk = raw_chunk_queue.get(timeout=0.01)
                                 if isinstance(raw_chunk, Exception):
                                     raise raw_chunk
+                                slot = submitted_chunks % buffer_size
+                                io_buffer[slot] = orjson.dumps(raw_chunk)
                                 future = executor.submit(
                                     process_chunk, 
-                                    llm, raw_chunk, tokenizer,
+                                    llm, io_buffer, submitted_chunks % buffer_size, tokenizer,
                                     cfg.finetune.seq_length, rl_config, dataset_queue
                                 )
                                 future.add_done_callback(
@@ -367,7 +375,10 @@ def run_preprocessing_loop(
 
                         try:
                             # Try to write the next dataset to the output stream, if it is ready
-                            dataset = dataset_queue.get(timeout=0.01)
+                            before  = time.time()
+                            pointer = dataset_queue.get(timeout=0.01)
+                            dataset = orjson.loads(io_buffer[pointer])
+                            fetching_took = time.time() - before                            
                         except Empty:
                             continue
                         start_processing = time.time()
@@ -380,7 +391,7 @@ def run_preprocessing_loop(
                         stats_aggregator.update([len(entry["input_ids"]) for entry in dataset])
                         processed_chunks += 1
                         published_samples += len(dataset)
-                        max_model_version = max(dataset["model_version"])
+                        max_model_version = max([entry["model_version"] for entry in dataset])
                         samples_in_queue = dataset_queue.qsize() * cfg.preprocess.chunk_size                        
                         stats = {
                             "preprocessor/published_samples": published_samples,
@@ -393,7 +404,7 @@ def run_preprocessing_loop(
                         stats_writer.write(stats)
                         processing_took = time.time() - start_processing
                         logger.info(
-                            f"Processed {len(dataset)} samples in {processing_took:.3f}s (writing took {writing_took}) and wrote to {output_stream}, total {published_samples} samples so far, {samples_in_queue} samples in queue"
+                            f"Processed {len(dataset)} samples in {processing_took:.3f}s (fetching_took {fetching_took:.3f}, writing took {writing_took:.3f}) and wrote to {output_stream}, total {published_samples} samples so far, {samples_in_queue} samples in queue"
                         )
                     except Exception as e:
                         logger.error(f"Error in preprocessor worker: {e}")
