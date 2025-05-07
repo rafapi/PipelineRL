@@ -132,6 +132,7 @@ async def schedule_rollouts(
     active_rollouts = [0] * len(llms)
     started_rollouts = 0
     finished_rollouts = 0
+    max_group_size_bytes = 0
     # Track rollouts per problem group
     group_rollouts = {}
 
@@ -142,7 +143,7 @@ async def schedule_rollouts(
         llm_index: int, 
         session: aiohttp.ClientSession,
     ):
-        nonlocal started_rollouts, finished_rollouts
+        nonlocal started_rollouts, finished_rollouts, max_group_size_bytes
         try:
             llm = llms[llm_index]
             model_version = trainer_state.propagated_weight_version
@@ -160,7 +161,9 @@ async def schedule_rollouts(
             if len(group_rollouts[group_id]) == attempts:
                 # This is blocking call, but there's just one other thread reading from this queue.
                 random.shuffle(group_rollouts[group_id]) 
-                io_buffer[slot] = pickle.dumps(group_rollouts[group_id])
+                group_bytes = pickle.dumps(group_rollouts[group_id])
+                max_group_size_bytes = max(max_group_size_bytes, len(group_bytes))
+                io_buffer[slot] = group_bytes
                 result_queue.put(slot)
                 del group_rollouts[group_id]
             finished_rollouts += 1
@@ -193,7 +196,8 @@ async def schedule_rollouts(
                             f"rollouts in progress: {sum(active_rollouts)}, "
                             f"groups in progress: {len(group_rollouts)}, "
                             f"rollouts started so far: {started_rollouts}, "
-                            f"rollouts finished so far: {finished_rollouts}")
+                            f"rollouts finished so far: {finished_rollouts}, "
+                            f"max group size in bytes: {max_group_size_bytes}")
                 last_logged = time.time()
 
             if group_rollout_index == attempts:
@@ -297,6 +301,7 @@ class ActorLoop:
         self.smm = SharedMemoryManager()
         self.smm.start()
 
+        # for 8 attempts and ~10K max tokens the max entry size is ~310000 bytes
         entry_size = 1000000 * attempts
         self.max_groups_in_progress = 2 * len(self.llms) * ((cfg.actor.llm_max_rollouts + attempts - 1) // attempts)
         max_ready_groups_waiting = 128
@@ -453,15 +458,13 @@ class ActorLoop:
                     f" to {self.data_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the queue"
                 )
 
-                flattened_prompt_tokens = [
-                    call.prompt_length_tokens
-                    for result in rollout_results
-                    for call in result.llm_calls
+                prompt_length_tokens = [
+                    result.metrics["prompt_tokens"]
+                    for result in rollout_results                    
                 ]
-                flattened_output_tokens = [
-                    call.output_length_tokens
+                output_length_tokens = [
+                    result.metrics["output_tokens"]
                     for result in rollout_results
-                    for call in result.llm_calls
                 ]
                 max_model_version = 0
                 max_latency = 0
@@ -471,7 +474,7 @@ class ActorLoop:
                     max_latency = max(max_latency, result.latency)
                     self.update_stats(result)
 
-                self.stats_aggregator.update(flattened_prompt_tokens, flattened_output_tokens)
+                self.stats_aggregator.update(prompt_length_tokens, output_length_tokens)
 
                 finished_groups += 1
 
