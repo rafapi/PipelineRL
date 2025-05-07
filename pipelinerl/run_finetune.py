@@ -832,7 +832,7 @@ def rl_finetuning_worker(
                     if passes_took
                     else 0,
                     "throughput/real_tokens_per_sec": this_worker_tokens / step_took,
-                    "throughput/passes_per_sec": 1 / sum(passes_took) if passes_took else 0,
+                    "throughput/sec_per_pass": sum(passes_took) / len(passes_took) if passes_took else 0,
                     "throughput/steps_per_sec": 1 / step_took if step_took else 0,
                     "throughput/samples_per_sec": samples_per_step / sum(passes_took) if passes_took else 0, 
                     "throughput/sec_per_step": step_took,
