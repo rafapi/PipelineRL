@@ -340,6 +340,8 @@ def run_preprocessing_loop(
             dummy = entry_size * b" " 
             dataset_queue = manager.Queue(max_dataset_queue_size)
             io_buffer = smm.ShareableList([dummy] * buffer_size)
+            free_slots = set(range(buffer_size))
+
             logger.info(f"Shared memory buffer size: {buffer_size * entry_size / 2 ** 30} Gb")
             logger.info(f"Start {worker_pool_size} workers for preprocessing")
             with ProcessPoolExecutor(max_workers=worker_pool_size) as executor:
@@ -351,7 +353,7 @@ def run_preprocessing_loop(
                                 raw_chunk = raw_chunk_queue.get(timeout=0.001)
                                 if isinstance(raw_chunk, Exception):
                                     raise raw_chunk
-                                slot = submitted_chunks % buffer_size
+                                slot = free_slots.pop()
                                 io_buffer[slot] = pickle.dumps(raw_chunk)
                                 future = executor.submit(
                                     process_chunk, 
@@ -374,8 +376,9 @@ def run_preprocessing_loop(
                         start_processing = time.time()
                         try:
                             # Try to write the next dataset to the output stream, if it is ready
-                            pointer = dataset_queue.get(timeout=0.001)
-                            dataset = pickle.loads(io_buffer[pointer])
+                            slot = dataset_queue.get(timeout=0.001)
+                            dataset = pickle.loads(io_buffer[slot])
+                            free_slots.add(slot)
                             fetching_took = time.time() - start_processing                            
                         except Empty:
                             continue
