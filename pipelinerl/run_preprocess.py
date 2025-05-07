@@ -337,7 +337,7 @@ def run_preprocessing_loop(
             max_dataset_queue_size = 128
             max_pool_tasks = 2 * worker_pool_size
             buffer_size = 2 * max_pool_tasks + max_dataset_queue_size
-            entry_size = 5000000
+            entry_size = 9999900
             dummy = entry_size * b" " 
             dataset_queue = manager.Queue(max_dataset_queue_size)
             io_buffer = smm.ShareableList([dummy] * buffer_size)
