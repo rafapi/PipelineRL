@@ -293,6 +293,7 @@ def run_redis(cfg: DictConfig):
         "--port", str(cfg.streams.port),
         "--dir", str(cfg.output_dir),
         "--protected-mode", "no"
+        "--save", cfg.streams.save
     ]
     logger.info(f"Running redis with command: {' '.join(cmd)}")
     yield _popen(cmd, env=dict(os.environ))
