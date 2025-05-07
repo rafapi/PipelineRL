@@ -407,6 +407,14 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
     return processes
 
 
+def setup_logging(log_file: Path):
+    file_handler = logging.FileHandler(log_file)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    file_handler.setFormatter(formatter)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(file_handler)
+    logger.info("Logging setup complete")
+
 
 @hydra.main(
     config_path="../conf/",
@@ -416,10 +424,13 @@ def launch_jobs(cfg: DictConfig, world_map: WorldMap, job_kind_filter: list | No
 def main(cfg: DictConfig):    
     validate_config(cfg)
 
-    world_map = WorldMap(cfg, verbose=True)
     exp_dir = Path(cfg.output_dir)    
     config_dir = exp_dir / "conf"
 
+    os.makedirs(exp_dir / "launcher", exist_ok=True)
+    log_file = exp_dir / "launcher" / f"launcher_{os.environ.get("RANK", 0)}.log"
+    setup_logging(log_file)
+    world_map = WorldMap(cfg, verbose=True)
 
     group = str(exp_dir)
     root = cfg.finetune.wandb_workspace_root
