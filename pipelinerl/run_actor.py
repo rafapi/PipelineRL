@@ -303,7 +303,8 @@ class ActorLoop:
 
         # for 8 attempts and ~10K max tokens the max entry size is ~310000 bytes
         entry_size = 1000000 * attempts
-        self.max_groups_in_progress = 2 * len(self.llms) * ((cfg.actor.llm_max_rollouts + attempts - 1) // attempts)
+        # we can have a pending almost ready group for each last rollout in progress ...
+        self.max_groups_in_progress = cfg.actor.llm_max_rollouts * len(self.llms)
         max_ready_groups_waiting = 128
         self.problem_queue = mp.Queue()
         self.result_queue = mp.Queue(max_ready_groups_waiting)
@@ -453,9 +454,11 @@ class ActorLoop:
                 for r in rollout_results:
                     for text in r.training_texts:
                         data_stream_writer.write(text)
+                in_progress = submitted_groups - finished_groups
                 logger.info(
                     f"Published {group_samples}{' ' + split_name if split_name else ''} samples"
-                    f" to {self.data_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the queue"
+                    f" to {self.data_stream}, total {published_samples} samples so far, {samples_in_queue} samples in the queue,"
+                    f" {in_progress} groups in progress"
                 )
 
                 prompt_length_tokens = [

@@ -270,6 +270,7 @@ def process_chunk(
     except Exception as e:
         logger.error(f"Failed to preprocess chunk: {e}")
         io_buffer[slot] = pickle.dumps(e)
+        dataset_queue.put(slot)
 
 
 def run_preprocessing_loop(
@@ -357,7 +358,7 @@ def run_preprocessing_loop(
                                 io_buffer[slot] = pickle.dumps(raw_chunk)
                                 future = executor.submit(
                                     process_chunk, 
-                                    llm, io_buffer, submitted_chunks % buffer_size, tokenizer,
+                                    llm, io_buffer, slot, tokenizer,
                                     cfg.finetune.seq_length, rl_config, dataset_queue
                                 )
                                 future.add_done_callback(
